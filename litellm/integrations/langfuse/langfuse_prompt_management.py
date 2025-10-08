@@ -1,7 +1,7 @@
-"""
-Call Hook for LiteLLM Proxy which allows Langfuse prompt management.
-"""
+"""Call Hook for LiteLLM Proxy which allows Langfuse prompt management."""
 
+import hashlib
+import json
 import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union, cast
@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Uni
 from packaging.version import Version
 from typing_extensions import TypeAlias
 
+import litellm
+from litellm.caching import DualCache
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.prompt_management_base import PromptManagementClient
 from litellm.litellm_core_utils.asyncify import run_async_function
@@ -36,6 +38,8 @@ else:
     LangfuseClass = Any
     LiteLLMLoggingObj = Any
 in_memory_dynamic_logger_cache = DynamicLoggingCache()
+langfuse_prompt_compilation_cache = DualCache()
+langfuse_prompt_existence_cache = DualCache()
 
 
 @lru_cache(maxsize=10)
@@ -124,10 +128,71 @@ class LangfusePromptManagement(LangFuseLogger, PromptManagementBase, CustomLogge
             langfuse_host=langfuse_host,
             flush_interval=flush_interval,
         )
+        self._prompt_client_cache: Dict[str, PROMPT_CLIENT] = {}
 
     @property
     def integration_name(self):
         return "langfuse"
+
+    def _generate_prompt_cache_key(
+        self,
+        prompt_id: str,
+        prompt_variables: Optional[dict],
+        dynamic_callback_params: StandardCallbackDynamicParams,
+        prompt_label: Optional[str],
+        prompt_version: Optional[int],
+    ) -> str:
+        cache_payload = {
+            "prompt_id": prompt_id,
+            "prompt_label": prompt_label,
+            "prompt_version": prompt_version,
+            "prompt_variables": prompt_variables or {},
+            "langfuse_host": (
+                dynamic_callback_params.get("langfuse_host")
+                or getattr(self, "langfuse_host", None)
+            ),
+            "langfuse_public_key": (
+                dynamic_callback_params.get("langfuse_public_key")
+                or getattr(self, "public_key", None)
+            ),
+            "langfuse_secret": (
+                dynamic_callback_params.get("langfuse_secret")
+                or dynamic_callback_params.get("langfuse_secret_key")
+                or getattr(self, "secret_key", None)
+            ),
+        }
+        serialized_payload = json.dumps(cache_payload, sort_keys=True, default=str)
+        hashed_key = hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest()
+        return f"langfuse_prompt::{hashed_key}"
+
+    def _generate_prompt_client_cache_key(
+        self,
+        prompt_id: str,
+        dynamic_callback_params: StandardCallbackDynamicParams,
+        prompt_label: Optional[str],
+        prompt_version: Optional[int],
+    ) -> str:
+        cache_payload = {
+            "prompt_id": prompt_id,
+            "prompt_label": prompt_label,
+            "prompt_version": prompt_version,
+            "langfuse_host": (
+                dynamic_callback_params.get("langfuse_host")
+                or getattr(self, "langfuse_host", None)
+            ),
+            "langfuse_public_key": (
+                dynamic_callback_params.get("langfuse_public_key")
+                or getattr(self, "public_key", None)
+            ),
+            "langfuse_secret": (
+                dynamic_callback_params.get("langfuse_secret")
+                or dynamic_callback_params.get("langfuse_secret_key")
+                or getattr(self, "secret_key", None)
+            ),
+        }
+        serialized_payload = json.dumps(cache_payload, sort_keys=True, default=str)
+        hashed_key = hashlib.sha256(serialized_payload.encode("utf-8")).hexdigest()
+        return f"langfuse_prompt_client::{hashed_key}"
 
     def _get_prompt_from_id(
         self,
@@ -135,11 +200,20 @@ class LangfusePromptManagement(LangFuseLogger, PromptManagementBase, CustomLogge
         langfuse_client: LangfuseClass,
         prompt_label: Optional[str] = None,
         prompt_version: Optional[int] = None,
+        cache_key: Optional[str] = None,
     ) -> PROMPT_CLIENT:
+
+        if cache_key is not None:
+            cached_prompt_client = self._prompt_client_cache.get(cache_key)
+            if cached_prompt_client is not None:
+                return cached_prompt_client
 
         prompt_client = langfuse_client.get_prompt(
             langfuse_prompt_id, label=prompt_label, version=prompt_version
         )
+
+        if cache_key is not None:
+            self._prompt_client_cache[cache_key] = prompt_client
 
         return prompt_client
 
@@ -208,6 +282,17 @@ class LangfusePromptManagement(LangFuseLogger, PromptManagementBase, CustomLogge
         prompt_id: str,
         dynamic_callback_params: StandardCallbackDynamicParams,
     ) -> bool:
+        cache_key = self._generate_prompt_client_cache_key(
+            prompt_id=prompt_id,
+            dynamic_callback_params=dynamic_callback_params,
+            prompt_label=None,
+            prompt_version=None,
+        )
+
+        cached_existence = langfuse_prompt_existence_cache.get_cache(cache_key)
+        if isinstance(cached_existence, bool):
+            return cached_existence
+
         langfuse_client = langfuse_client_init(
             langfuse_public_key=dynamic_callback_params.get("langfuse_public_key"),
             langfuse_secret=dynamic_callback_params.get("langfuse_secret"),
@@ -217,8 +302,18 @@ class LangfusePromptManagement(LangFuseLogger, PromptManagementBase, CustomLogge
         langfuse_prompt_client = self._get_prompt_from_id(
             langfuse_prompt_id=prompt_id,
             langfuse_client=langfuse_client,
+            cache_key=cache_key,
         )
-        return langfuse_prompt_client is not None
+        prompt_exists = langfuse_prompt_client is not None
+        try:
+            langfuse_prompt_existence_cache.set_cache(
+                key=cache_key,
+                value=prompt_exists,
+                ttl=litellm.LANGFUSE_PROMPT_CACHE_TTL_SECONDS,
+            )
+        except Exception:
+            pass
+        return prompt_exists
 
     def _compile_prompt_helper(
         self,
@@ -228,17 +323,36 @@ class LangfusePromptManagement(LangFuseLogger, PromptManagementBase, CustomLogge
         prompt_label: Optional[str] = None,
         prompt_version: Optional[int] = None,
     ) -> PromptManagementClient:
+        cache_key = self._generate_prompt_cache_key(
+            prompt_id=prompt_id,
+            prompt_variables=prompt_variables,
+            dynamic_callback_params=dynamic_callback_params,
+            prompt_label=prompt_label,
+            prompt_version=prompt_version,
+        )
+
+        cached_prompt = langfuse_prompt_compilation_cache.get_cache(cache_key)
+        if cached_prompt is not None:
+            return cast(PromptManagementClient, cached_prompt)
+
         langfuse_client = langfuse_client_init(
             langfuse_public_key=dynamic_callback_params.get("langfuse_public_key"),
             langfuse_secret=dynamic_callback_params.get("langfuse_secret"),
             langfuse_secret_key=dynamic_callback_params.get("langfuse_secret_key"),
             langfuse_host=dynamic_callback_params.get("langfuse_host"),
         )
+        prompt_client_cache_key = self._generate_prompt_client_cache_key(
+            prompt_id=prompt_id,
+            dynamic_callback_params=dynamic_callback_params,
+            prompt_label=prompt_label,
+            prompt_version=prompt_version,
+        )
         langfuse_prompt_client = self._get_prompt_from_id(
             langfuse_prompt_id=prompt_id,
             langfuse_client=langfuse_client,
             prompt_label=prompt_label,
             prompt_version=prompt_version,
+            cache_key=prompt_client_cache_key,
         )
 
         ## SET PROMPT
@@ -254,13 +368,24 @@ class LangfusePromptManagement(LangFuseLogger, PromptManagementBase, CustomLogge
             langfuse_prompt_client
         )
 
-        return PromptManagementClient(
+        prompt_management_client = PromptManagementClient(
             prompt_id=prompt_id,
             prompt_template=compiled_prompt,
             prompt_template_model=template_model,
             prompt_template_optional_params=template_optional_params,
             completed_messages=None,
         )
+
+        try:
+            langfuse_prompt_compilation_cache.set_cache(
+                key=cache_key,
+                value=prompt_management_client,
+                ttl=litellm.LANGFUSE_PROMPT_CACHE_TTL_SECONDS,
+            )
+        except Exception:
+            pass
+
+        return prompt_management_client
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
         return run_async_function(
