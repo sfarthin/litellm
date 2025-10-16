@@ -577,6 +577,7 @@ router_settings:
 | HUGGINGFACE_API_BASE | Base URL for Hugging Face API
 | HUGGINGFACE_API_KEY | API key for Hugging Face API
 | HUMANLOOP_PROMPT_CACHE_TTL_SECONDS | Time-to-live in seconds for cached prompts in Humanloop. Default is 60
+| LANGFUSE_PROMPT_CACHE_TTL_SECONDS | Time-to-live in seconds for cached prompts retrieved from Langfuse. Default is 60
 | IAM_TOKEN_DB_AUTH | IAM token for database authentication
 | INITIAL_RETRY_DELAY | Initial delay in seconds for retrying requests. Default is 0.5
 | JITTER | Jitter factor for retry delay calculations. Default is 0.75

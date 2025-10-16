@@ -969,6 +969,9 @@ OPENAI_FINISH_REASONS = ["stop", "length", "function_call", "content_filter", "n
 HUMANLOOP_PROMPT_CACHE_TTL_SECONDS = int(
     os.getenv("HUMANLOOP_PROMPT_CACHE_TTL_SECONDS", 60)
 )  # 1 minute
+LANGFUSE_PROMPT_CACHE_TTL_SECONDS = int(
+    os.getenv("LANGFUSE_PROMPT_CACHE_TTL_SECONDS", 60)
+)
 RESPONSE_FORMAT_TOOL_NAME = "json_tool_call"  # default tool name used when converting response format to tool call
 
 ########################### Logging Callback Constants ###########################
